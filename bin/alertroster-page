@@ -9,9 +9,10 @@
 # acknowledged (Enter on the takeover, or the bar panel). A low-urgency page
 # is a red count in the bar and a notification.
 #
-# If this machine is signed in (alertroster-login) and --remote is given, the
-# page is raised on your AlertRoster account instead, so it escalates to the
-# roster's phones if you do not answer. Without --remote it stays local.
+# With --remote the page is raised on your AlertRoster account instead, so it
+# escalates to the roster's phones if you do not answer. That needs a sync
+# integration key for a source on the account (alertroster-login --sync-key).
+# Without --remote it stays local.
 
 set -euo pipefail
 
@@ -34,9 +35,25 @@ title="${args[*]:-}"
 [[ -n $title ]] || { echo "alertroster-page: a title is required" >&2; exit 2; }
 
 if (( remote )); then
+  # Raising an incident is a source's job, not a responder's, so this goes
+  # over Lane B with a sync integration key rather than the login token.
+  # Store one with: alertroster-login --sync-key ark_sync_...
+  key=$(secret-tool lookup service alertroster kind sync-key 2>/dev/null) || true
+  [[ -n $key ]] || { echo "alertroster-page: no integration key — run: alertroster-login --sync-key ark_sync_..." >&2; exit 3; }
+  host="https://alertroster.com"
+  hf="${XDG_CONFIG_HOME:-$HOME/.config}/alertroster/host"; [[ -f $hf ]] && host="$(<"$hf")"
   body=$(jq -cn --arg t "$title" --arg u "$urgency" --arg s "$source" \
-    '{title:$t, urgency:$u, dedup_key:("cli-" + ($t|@base64))}')
-  alertroster-api POST /api/v1/incidents "$body" >/dev/null
+    '{title:$t, urgency:$u, dedup_key:($s + ":" + ($t|@base64))}')
+  out=$(curl -sS --max-time 8 -w '\n%{http_code}' -X POST "${host%/}/api/v2/incidents" \
+    -H "Authorization: Bearer $key" -H "Content-Type: application/json" --data "$body") || exit 5
+  code=${out##*$'\n'}; body=${out%$'\n'*}
+  case "$code" in
+    201) echo "Raised on your account: $(jq -r .incident.id <<<"$body")" ;;
+    200) echo "Already open on your account: $(jq -r .incident.id <<<"$body")" ;;
+    401) echo "alertroster-page: integration key refused" >&2; exit 4 ;;
+    *) echo "alertroster-page: HTTP $code $(jq -r '.error // empty' <<<"$body" 2>/dev/null)" >&2; exit 5 ;;
+  esac
+  omarchy-shell alertroster.pager refresh >/dev/null 2>&1 || true
   exit
 fi
 

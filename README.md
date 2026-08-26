@@ -68,14 +68,17 @@ clicking, and the window manager do nothing — that is the point.
 ## Sign in to page your roster
 
 ```bash
-alertroster-login            # email → one-time code → tokens in your keyring
+alertroster-login                          # email → one-time code → tokens in your keyring
+alertroster-login --sync-key ark_sync_…    # an integration key for a source on your account
 alertroster-page --remote "Kamal deploy failed"
 ```
 
 Once signed in the bar mirrors your account's open incidents, the takeover
 fires when the core says an incident is paging *you*, and acknowledging from
-the desktop stops the escalation for everyone. `--remote` raises the page on
-your account so it escalates to the roster's phones if you do not answer.
+the desktop stops the escalation for everyone — on phones, on other
+workstations, and on any AlertRoster hardware receivers in the room.
+`--remote` raises the page on your account through a source's integration
+key, so it escalates to the roster if you do not answer.
 
 The plugin is a thin client. For incidents from AlertRoster it renders what
 the core sends — `emergency`, `available_actions`, `status` — and decides none

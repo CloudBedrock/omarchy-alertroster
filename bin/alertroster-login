@@ -5,6 +5,7 @@
 #
 #   alertroster-login                      # https://alertroster.com
 #   alertroster-login --host https://ar.example.com
+#   alertroster-login --sync-key ark_sync_…   # lets alertroster-page --remote raise incidents
 #   alertroster-login --logout
 
 set -euo pipefail
@@ -20,9 +21,16 @@ host="https://alertroster.com"
 while (( $# > 0 )); do
   case "$1" in
     --host) host="${2:?--host needs a URL}"; shift 2 ;;
+    --sync-key)
+      key="${2:?--sync-key needs an ark_sync_ key}"
+      [[ $key == ark_sync_* ]] || { echo "that is not a sync integration key (ark_sync_…)" >&2; exit 2; }
+      printf %s "$key" | secret-tool store --label "AlertRoster integration key" service "$SERVICE" kind sync-key
+      echo "Integration key stored. alertroster-page --remote will raise incidents on that source."
+      exit 0 ;;
     --logout)
       secret-tool clear service "$SERVICE" kind access 2>/dev/null || true
       secret-tool clear service "$SERVICE" kind refresh 2>/dev/null || true
+      secret-tool clear service "$SERVICE" kind sync-key 2>/dev/null || true
       omarchy-shell alertroster.pager refresh >/dev/null 2>&1 || true
       echo "Signed out."
       exit 0 ;;

@@ -1,0 +1,48 @@
+#!/bin/bash
+# Page this desktop.
+#
+#   alertroster-page "Database is down"
+#   alertroster-page --low "Backup finished with warnings"
+#   make deploy || alertroster-page "Deploy failed: $(hostname)"
+#
+# A high-urgency page takes over the screen and sounds the alarm until it is
+# acknowledged (Enter on the takeover, or the bar panel). A low-urgency page
+# is a red count in the bar and a notification.
+#
+# If this machine is signed in (alertroster-login) and --remote is given, the
+# page is raised on your AlertRoster account instead, so it escalates to the
+# roster's phones if you do not answer. Without --remote it stays local.
+
+set -euo pipefail
+
+urgency="high"
+source="cli"
+remote=0
+args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --low) urgency="low"; shift ;;
+    --high) urgency="high"; shift ;;
+    --source) source="${2:?--source needs a name}"; shift 2 ;;
+    --remote) remote=1; shift ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+title="${args[*]:-}"
+[[ -n $title ]] || { echo "alertroster-page: a title is required" >&2; exit 2; }
+
+if (( remote )); then
+  body=$(jq -cn --arg t "$title" --arg u "$urgency" --arg s "$source" \
+    '{title:$t, urgency:$u, dedup_key:("cli-" + ($t|@base64))}')
+  alertroster-api POST /api/v1/incidents "$body" >/dev/null
+  exit
+fi
+
+result=$(omarchy-shell alertroster.pager page "$title" "$urgency" "$source" 2>&1) || {
+  echo "alertroster-page: the Omarchy shell did not answer — is the Pager plugin enabled?" >&2
+  echo "$result" >&2
+  exit 1
+}
+echo "$result"

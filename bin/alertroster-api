@@ -1,0 +1,70 @@
+#!/bin/bash
+# Authenticated call against the AlertRoster core, with the token refresh
+# cycle handled here so the shell plugin never sees a credential.
+#
+#   alertroster-api GET  /api/v1/incidents
+#   alertroster-api POST /api/v1/incidents/<id>/acknowledge
+#
+# Exit codes: 0 ok (body on stdout) · 3 not signed in · 4 auth refused after
+# refresh · 5 network/other. The plugin keys off these, so keep them stable.
+
+set -uo pipefail
+
+SERVICE="alertroster"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/alertroster"
+HOST_FILE="$CONFIG_DIR/host"
+
+method="${1:-}"
+path="${2:-}"
+body="${3:-}"
+[[ -n $method && -n $path ]] || { echo "usage: alertroster-api <METHOD> <path> [json-body]" >&2; exit 2; }
+
+host="https://alertroster.com"
+[[ -f $HOST_FILE ]] && host="$(<"$HOST_FILE")"
+
+lookup() { secret-tool lookup service "$SERVICE" kind "$1" 2>/dev/null; }
+store()  { printf %s "$2" | secret-tool store --label "AlertRoster $1" service "$SERVICE" kind "$1" 2>/dev/null; }
+
+access="$(lookup access)"
+refresh="$(lookup refresh)"
+[[ -n $access || -n $refresh ]] || exit 3
+
+call() {
+  local code
+  code=$(curl -sS --max-time 8 -o "$tmp" -w '%{http_code}' \
+    -X "$method" "$host$path" \
+    -H "Authorization: Bearer $1" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    ${body:+--data "$body"}) || return 5
+  echo "$code"
+}
+
+do_refresh() {
+  [[ -n $refresh ]] || return 1
+  local out
+  out=$(curl -sS --max-time 8 -X POST "$host/api/v1/auth/refresh" \
+    -H "Content-Type: application/json" \
+    --data "$(jq -cn --arg t "$refresh" '{refresh_token:$t}')") || return 1
+  local a r
+  a=$(jq -r '.access_token // empty' <<<"$out")
+  r=$(jq -r '.refresh_token // empty' <<<"$out")
+  [[ -n $a && -n $r ]] || return 1
+  store access "$a"; store refresh "$r"
+  access="$a"; refresh="$r"
+}
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+code=$(call "$access") || exit 5
+if [[ $code == 401 ]]; then
+  do_refresh || exit 4
+  code=$(call "$access") || exit 5
+  [[ $code == 401 ]] && exit 4
+fi
+
+cat "$tmp"
+[[ $code =~ ^2 ]] && exit 0
+echo "alertroster-api: $method $path → HTTP $code" >&2
+exit 5

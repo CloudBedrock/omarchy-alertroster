@@ -1,0 +1,84 @@
+#!/bin/bash
+# Dead-man's switch for anything on this machine.
+#
+#   alertroster-heartbeat expect nightly-backup 26h     # page me if it goes quiet
+#   alertroster-heartbeat expect sync 10m --low
+#   alertroster-heartbeat ping nightly-backup            # put this at the end of the job
+#   alertroster-heartbeat forget nightly-backup
+#   alertroster-heartbeat list
+#   alertroster-heartbeat check                          # used by the plugin; prints overdue names as JSON
+#
+# "expect" records how often a ping must arrive. "ping" touches the stamp.
+# The plugin runs "check" on its refresh interval and raises a page for each
+# beat that has gone overdue, once per lapse.
+
+set -euo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/alertroster/heartbeats.json"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/alertroster/heartbeats"
+mkdir -p "$(dirname "$CONFIG")" "$STATE"
+[[ -f $CONFIG ]] || echo '{}' >"$CONFIG"
+
+to_seconds() {
+  local v="$1"
+  case "$v" in
+    *s) echo "${v%s}" ;;
+    *m) echo $(( ${v%m} * 60 )) ;;
+    *h) echo $(( ${v%h} * 3600 )) ;;
+    *d) echo $(( ${v%d} * 86400 )) ;;
+    *) echo "$v" ;;
+  esac
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  expect)
+    name="${1:?name}"; every="${2:?interval like 10m, 2h, 1d}"; shift 2
+    urgency="high"; [[ ${1:-} == "--low" ]] && urgency="low"
+    secs=$(to_seconds "$every")
+    tmp=$(mktemp)
+    jq --arg n "$name" --argjson s "$secs" --arg u "$urgency" \
+      '.[$n] = {every: $s, urgency: $u}' "$CONFIG" >"$tmp" && mv "$tmp" "$CONFIG"
+    touch "$STATE/$name"
+    echo "Expecting a ping from '$name' every $every."
+    ;;
+  ping)
+    name="${1:?name}"
+    touch "$STATE/$name"
+    rm -f "$STATE/$name.paged"
+    ;;
+  forget)
+    name="${1:?name}"
+    tmp=$(mktemp)
+    jq --arg n "$name" 'del(.[$n])' "$CONFIG" >"$tmp" && mv "$tmp" "$CONFIG"
+    rm -f "$STATE/$name" "$STATE/$name.paged"
+    ;;
+  list)
+    now=$(date +%s)
+    jq -r 'to_entries[] | "\(.key)\t\(.value.every)\t\(.value.urgency)"' "$CONFIG" | while IFS=$'\t' read -r n every u; do
+      if [[ -f $STATE/$n ]]; then
+        age=$(( now - $(stat -c %Y "$STATE/$n") ))
+        printf '%-24s every %6ss  last ping %6ss ago  %s\n' "$n" "$every" "$age" "$u"
+      else
+        printf '%-24s every %6ss  never pinged  %s\n' "$n" "$every" "$u"
+      fi
+    done
+    ;;
+  check)
+    now=$(date +%s)
+    out="[]"
+    while IFS=$'\t' read -r n every u; do
+      [[ -n $n ]] || continue
+      stamp="$STATE/$n"
+      last=0; [[ -f $stamp ]] && last=$(stat -c %Y "$stamp")
+      if (( now - last > every )) && [[ ! -f $stamp.paged ]]; then
+        touch "$stamp.paged"
+        out=$(jq -c --arg n "$n" --arg u "$u" --argjson a $(( now - last )) \
+          '. + [{name:$n, urgency:$u, silentFor:$a}]' <<<"$out")
+      fi
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.every)\t\(.value.urgency)"' "$CONFIG")
+    echo "$out"
+    ;;
+  *)
+    sed -n '2,13p' "$0"; exit 2 ;;
+esac

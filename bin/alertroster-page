@@ -48,22 +48,8 @@ while (( $# > 0 )); do
     --timeout) timeout="${2:?--timeout needs seconds (0 = none)}"; shift 2 ;;
     --dedup) dedup="${2:?--dedup needs a key}"; shift 2 ;;   # one open alert per key; a repeat returns it
     --remote) remote=1; shift ;;
-    --pair)
-      code="${2:?--pair needs the 8-digit code from the Pairing screen of the station}"; shift 2
-      station="http://127.0.0.1:${ALERTROSTER_RECEIVER_PORT:-4747}"
-      [[ ${1:-} == --station ]] && { station="${2:?--station needs a URL}"; shift 2; }
-      body=$(jq -cn --arg c "$code" --arg n "alertroster-page@$(hostname)" '{code:$c, name:$n, kind:"cli"}')
-      out=$(curl -sS --max-time 8 -w '\n%{http_code}' -X POST "${station%/}/v1/pair" \
-        -H "Content-Type: application/json" --data "$body") || { echo "alertroster-page: $station did not answer" >&2; exit 5; }
-      http=${out##*$'\n'}; out=${out%$'\n'*}
-      [[ $http == 201 ]] || { echo "alertroster-page: pairing refused (HTTP $http) — wrong code, or the window is shut" >&2; exit 4; }
-      token=$(jq -r '.token // empty' <<<"$out")
-      [[ -n $token ]] || { echo "alertroster-page: unexpected reply from $station" >&2; exit 5; }
-      mkdir -p "$CONFIG_DIR"
-      printf %s "${station%/}" >"$STATION_FILE"
-      printf %s "$token" | secret-tool store --label "AlertRoster receiver token" service alertroster kind receiver-token
-      echo "Paired with $station as $(jq -r .id <<<"$out"). Pages from this machine now go there."
-      exit 0 ;;
+    --pair) pair_code="${2:?--pair needs the 8-digit code from the Pairing screen of the station}"; shift 2 ;;
+    --station) station_arg="${2:?--station needs a URL}"; shift 2 ;;
     --unpair)
       "$BIN_DIR/alertroster-local" DELETE /v1/sources/self >/dev/null 2>&1 || true
       secret-tool clear service alertroster kind receiver-token 2>/dev/null || true
@@ -74,6 +60,24 @@ while (( $# > 0 )); do
     *) args+=("$1"); shift ;;
   esac
 done
+
+if [[ -n ${pair_code:-} ]]; then
+  station="${station_arg:-http://127.0.0.1:${ALERTROSTER_RECEIVER_PORT:-4747}}"
+  body=$(jq -cn --arg c "$pair_code" --arg n "alertroster-page@$(hostname)" '{code:$c, name:$n, kind:"cli"}')
+  out=$(curl -sS --max-time 8 -w '\n%{http_code}' -X POST "${station%/}/v1/pair" \
+    -H "Content-Type: application/json" --data "$body") || { echo "alertroster-page: $station did not answer" >&2; exit 5; }
+  http=${out##*$'\n'}; out=${out%$'\n'*}
+  [[ $http == 201 ]] || { echo "alertroster-page: pairing refused (HTTP $http) — wrong code, or the window is shut" >&2; exit 4; }
+  token=$(jq -r '.token // empty' <<<"$out")
+  [[ -n $token ]] || { echo "alertroster-page: unexpected reply from $station" >&2; exit 5; }
+  mkdir -p "$CONFIG_DIR"
+  printf %s "${station%/}" >"$STATION_FILE"
+  printf %s "$token" | secret-tool store --label "AlertRoster receiver token" service alertroster kind receiver-token
+  echo "Paired with $station as $(jq -r .id <<<"$out"). Pages from this machine now go there."
+  exit 0
+fi
+[[ -z ${station_arg:-} ]] || { echo "alertroster-page: --station only means something with --pair" >&2; exit 2; }
+[[ -z $timeout || $timeout =~ ^[0-9]+$ ]] || { echo "alertroster-page: --timeout needs whole seconds" >&2; exit 2; }
 
 title="${args[*]:-}"
 [[ -n $title ]] || { echo "alertroster-page: a title is required" >&2; exit 2; }
@@ -119,7 +123,7 @@ case $rc in
   *) echo "$out" >&2; exit "$rc" ;;
 esac
 
-result=$(omarchy-shell alertroster.pager page "$title" "$urgency" "$source" 2>&1) || {
+result=$(omarchy-shell alertroster.pager pageDetailed "$title" "$urgency" "$source" "$detail" 2>&1) || {
   echo "alertroster-page: the Omarchy shell did not answer — is the Pager plugin enabled?" >&2
   echo "$result" >&2
   exit 1

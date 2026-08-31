@@ -44,7 +44,7 @@ function localEmergency(incident) {
   return incident.status === "triggered" && incident.urgency === "high"
 }
 
-function makeLocalIncident(serial, title, urgency, source, nowIso) {
+function makeLocalIncident(serial, title, urgency, source, nowIso, detail) {
   var u = String(urgency || "high").toLowerCase() === "low" ? "low" : "high"
   var incident = {
     id: "local-" + serial,
@@ -52,7 +52,7 @@ function makeLocalIncident(serial, title, urgency, source, nowIso) {
     status: "triggered",
     urgency: u,
     title: String(title || "").trim() || "Untitled page",
-    detail: null,
+    detail: String(detail || "").trim() || null,
     dedup_key: null,
     source_id: null,
     source_name: String(source || "local"),

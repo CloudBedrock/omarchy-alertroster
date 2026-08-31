@@ -16,6 +16,7 @@ Panel {
   readonly property bool paging: pager ? pager.paging : false
   readonly property int triggered: pager ? pager.triggeredCount : 0
   readonly property string link: pager ? pager.link : "local"
+  readonly property string surface: pager ? pager.surface : "absent"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -58,12 +59,8 @@ Panel {
     if (inc && pager && Model.canAct(inc, "resolved")) pager.resolve(inc.id)
   }
   function linkLabel() {
-    switch (link) {
-      case "connected": return "Connected to AlertRoster"
-      case "offline": return "AlertRoster unreachable — showing last sync"
-      case "unauthorized": return "Signed out — run alertroster-login"
-    }
-    return "Local only — run alertroster-login to page your roster"
+    var cloud = Model.cloudLinkLabel(link)
+    return Model.surfaceLabel(surface) + (cloud !== "" ? " · " + cloud : "")
   }
 
   BarIconButton {
@@ -149,6 +146,7 @@ Panel {
           visible: root.incidents.length === 0
           width: parent.width
           text: "Nothing is paging you.\n\nTry:  alertroster-page \"Deploy failed\"\nor press  t  for a test page."
+            + (root.link === "local" ? "\n\nSign in with alertroster-login to page your roster." : "")
           textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
@@ -208,9 +206,12 @@ Panel {
                 }
                 Text {
                   width: parent.width
-                  text: Model.statusLabel(row.modelData) + " · " + Model.sourceLabel(row.modelData) + " · " + Model.ageLabel(row.modelData.triggered_at, root.pager ? root.pager.nowMs : Date.now()) + (row.modelData.escalate_at ? " · " + Model.countdownLabel(row.modelData.escalate_at, root.pager ? root.pager.nowMs : Date.now()) : "")
+                  text: Model.statusLabel(row.modelData) + " · " + Model.sourceLabel(row.modelData) + " · " + Model.ageLabel(row.modelData.triggered_at, root.pager ? root.pager.nowMs : Date.now())
+                    + (Model.escalateAt(row.modelData) ? " · " + Model.countdownLabel(Model.escalateAt(row.modelData), root.pager ? root.pager.nowMs : Date.now()) : "")
+                    + (Model.ackedByLabel(row.modelData) !== "" ? " · " + Model.ackedByLabel(row.modelData) : "")
+                    + (Model.cloudLabel(row.modelData) !== "" ? " · " + Model.cloudLabel(row.modelData) : "")
                   textFormat: Text.PlainText
-                  color: row.modelData.emergency ? root.urgent : root.dim
+                  color: row.modelData.emergency || Model.cloudFailed(row.modelData) ? root.urgent : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
@@ -247,6 +248,7 @@ Panel {
         Text {
           width: parent.width
           text: (root.pager && root.pager.lastError !== "" ? root.pager.lastError + "\n" : "")
+            + (root.pager && root.surface !== "live" && root.surface !== "absent" && root.pager.surfaceDetail !== "" ? root.pager.surfaceDetail + "\n" : "")
             + "a acknowledge · r resolve · R refresh · t test page · Esc close"
           textFormat: Text.PlainText
           color: root.dim

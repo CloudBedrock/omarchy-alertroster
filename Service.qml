@@ -5,15 +5,21 @@ import Quickshell.Wayland
 import qs.Commons
 import "Model.js" as Model
 
-// The pager. One instance for the whole shell; holds the open incident set,
+// The pager. One instance for the whole shell; renders the open alert set,
 // raises the takeover, loops the alarm, and answers IPC.
 //
-// It is a thin client on purpose. For incidents from AlertRoster it renders
-// what the core sent — `emergency`, `available_actions`, `status` — and never
-// decides any of them itself. For pages raised on this machine there is no
-// core, so Model.js applies the single rule the core applies today (high +
-// triggered = paging until acknowledged) and nothing more: no escalation, no
-// roster, no phones. That gap is what signing in is for.
+// It is a surface of the receiver service (alertroster-receiverd,
+// LOCAL_ACK_PROTOCOL.md §5) when one is running: bin/alertroster-surface
+// holds the socket, this renders the snapshot and every delta, and an
+// acknowledgement goes back over that socket with the user's name. The
+// takeover comes down because the service's next delta carries
+// `emergency: false` — never because a button was pressed.
+//
+// With no service on the machine it falls back to holding pages itself, so
+// `alertroster-page` works on a box with nothing but Omarchy installed. That
+// embedded store applies the one rule the service applies (high + triggered
+// = paging until acknowledged) and nothing more: no timeouts, no escalation,
+// no roster. Signed in, it also mirrors your account's open incidents.
 Item {
   id: root
 
@@ -27,21 +33,36 @@ Item {
   readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string binDir: pluginDir + "/bin"
   readonly property string alarmFile: pluginDir + "/sounds/alarm.wav"
+  readonly property string user: Quickshell.env("USER") || ""
 
   // ---------------------------------------------------------------- state
+  // What the receiver service holds, from its snapshot and deltas.
+  property var serviceAlerts: []
+  // The embedded fallback: pages raised while no service answers.
   property var localIncidents: []
-  property var remoteIncidents: []
   property int localSerial: 0
+  // Your account's open incidents, when signed in.
+  property var remoteIncidents: []
 
-  // "local" — not signed in; "connected"; "offline" — signed in but the core
-  // is unreachable; "unauthorized" — tokens dead, sign in again.
+  // The surface link, as bin/alertroster-surface reports it:
+  // "live" — attached, the board is true; "down" — was live, re-dialling,
+  // the board is stale; "starting" — a service is expected but not answering
+  // yet; "unauthorized" — the token on disk was refused; "absent" — nothing
+  // to attach to, pages are held here.
+  property string surface: "absent"
+  property string surfaceDetail: ""
+  readonly property bool attached: surface === "live"
+  property bool snapshotSeen: false
+
+  // The cloud link: "local" — not signed in; "connected"; "offline" — signed
+  // in but the core is unreachable; "unauthorized" — tokens dead.
   property string link: "local"
   property string lastError: ""
   property double lastSyncMs: 0
   property bool syncing: false
   property double nowMs: Date.now()
 
-  readonly property var incidents: Model.sortForBoard(Model.openOnly(localIncidents).concat(Model.openOnly(remoteIncidents)))
+  readonly property var incidents: Model.sortForBoard(Model.openOnly(localIncidents).concat(Model.openOnly(serviceAlerts)).concat(Model.openOnly(remoteIncidents)))
   readonly property var emergencyIncident: Model.firstEmergency(incidents)
   readonly property bool paging: emergencyIncident !== null
   readonly property int triggeredCount: Model.countTriggered(incidents)
@@ -50,9 +71,10 @@ Item {
   readonly property bool takeoverEnabled: setting("takeover", true) === true
   readonly property int refreshIntervalSec: Math.max(2, Math.min(300, parseInt(String(setting("refreshIntervalSec", 5)), 10) || 5))
 
-  // Set while an ack/resolve is in flight for the takeover's incident, so the
-  // surface can say so — nothing else is visible while it is up.
+  // Set while an ack/resolve is in flight, so the takeover can say so —
+  // nothing else is visible while it is up.
   property string pendingAction: ""
+  property string pendingId: ""
   property string actionError: ""
 
   signal incidentOpened(var incident)
@@ -65,7 +87,19 @@ Item {
   function nowIso() { return new Date().toISOString() }
 
   // ---------------------------------------------------------------- pages
+  // Attached, a page is raised on the service like any other source's and
+  // comes back down the socket; the id is not known until then. Otherwise
+  // the embedded store holds it.
   function page(title, urgency, source) {
+    if (attached) {
+      raiseQueue.push({ title: String(title || ""), urgency: String(urgency || "high"), source: String(source || "shell") })
+      raiseNext()
+      return "sent"
+    }
+    return pageLocally(title, urgency, source)
+  }
+
+  function pageLocally(title, urgency, source) {
     localSerial += 1
     var incident = Model.makeLocalIncident(localSerial, title, urgency, source, nowIso())
     localIncidents = localIncidents.concat([incident])
@@ -73,23 +107,53 @@ Item {
     return incident.id
   }
 
+  property var raiseQueue: []
+  function raiseNext() {
+    if (raiseProcess.running || raiseQueue.length === 0) return
+    var next = raiseQueue.shift()
+    raiseProcess.request = next
+    raiseProcess.command = [binDir + "/alertroster-local", "POST", "/v1/alerts",
+      JSON.stringify({ title: next.title, urgency: next.urgency === "low" ? "low" : "high",
+                       detail: "Raised through the Omarchy shell (" + next.source + ")" })]
+    raiseProcess.running = true
+  }
+
+  Process {
+    id: raiseProcess
+    property var request: ({})
+    running: false
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: raiseErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        // The service did not take it. The page must still land somewhere.
+        root.lastError = "Receiver service refused a page: " + (String(raiseErr.text || "").trim() || "exit " + exitCode)
+        root.pageLocally(request.title, request.urgency, request.source)
+      }
+      root.raiseNext()
+    }
+  }
+
   function announce(incident) {
     incidentOpened(incident)
     if (incident.emergency && takeoverEnabled) return // the takeover *is* the notification
+    notify(incident.urgency === "high" ? "critical" : "normal", incident.title,
+           Model.sourceLabel(incident) + " · " + Model.statusLabel(incident).toLowerCase())
+  }
+
+  function notify(urgency, title, body) {
     Quickshell.execDetached([
       omarchyPath + "/bin/omarchy-notification-send",
       "--app-name", "AlertRoster",
       "-g", "󰂞",
-      "-u", incident.urgency === "high" ? "critical" : "normal",
-      incident.title,
-      Model.sourceLabel(incident) + " · " + Model.statusLabel(incident).toLowerCase()
+      "-u", urgency,
+      title,
+      body
     ])
   }
 
   function findIncident(id) {
-    var all = localIncidents.concat(remoteIncidents)
-    for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i]
-    return null
+    return Model.findById(localIncidents, id) || Model.findById(serviceAlerts, id) || Model.findById(remoteIncidents, id)
   }
 
   function act(id, action) {
@@ -103,12 +167,28 @@ Item {
       localIncidents = next
       return "ok"
     }
-    // Remote: ask the core, then re-sync. The takeover comes down when the
+    if (Model.isService(incident)) {
+      // Over the surface socket, with who answered (§5). The delta that
+      // follows is what changes the board; an error frame is what says no.
+      if (!attached) {
+        actionError = "receiver service unreachable — not acknowledged"
+        return "offline"
+      }
+      pendingAction = action
+      pendingId = id
+      actionError = ""
+      var frame = { action: action === "acknowledged" ? "acknowledge" : "resolve", id: id }
+      if (frame.action === "acknowledge") frame.user = user
+      surfaceProcess.write(JSON.stringify(frame) + "\n")
+      pendingTimeout.restart()
+      return "sent"
+    }
+    // Cloud: ask the core, then re-sync. The takeover comes down when the
     // core stops flagging the incident, not because a button was pressed.
     if (actionProcess.running) return "busy"
     pendingAction = action
+    pendingId = id
     actionError = ""
-    actionProcess.incidentId = id
     var route = action === "acknowledged" ? "acknowledge" : "resolve"
     actionProcess.command = [binDir + "/alertroster-api", "POST", "/api/v1/incidents/" + id + "/" + route]
     actionProcess.running = true
@@ -122,11 +202,132 @@ Item {
     if (emergencyIncident) acknowledge(emergencyIncident.id)
   }
 
-  function clearLocal() {
-    localIncidents = []
+  function settlePending() {
+    pendingAction = ""
+    pendingId = ""
+    pendingTimeout.stop()
   }
 
-  // ---------------------------------------------------------------- sync
+  Timer {
+    id: pendingTimeout
+    interval: 6000
+    onTriggered: {
+      if (root.pendingAction === "" || !Model.isService(root.findIncident(root.pendingId) || {})) return
+      root.actionError = "no answer from the receiver service"
+      root.settlePending()
+    }
+  }
+
+  function clearLocal() {
+    localIncidents = []
+    // A board the service is no longer answering for is not one this
+    // machine can act on; `clear` is the escape hatch that drops it.
+    if (!attached) serviceAlerts = []
+  }
+
+  // ---------------------------------------------------------------- surface
+  // bin/alertroster-surface holds the socket to the receiver service and
+  // speaks JSON lines: every frame the service sends on stdout, every action
+  // we write on stdin. It re-dials on its own and reports the link state.
+  Process {
+    id: surfaceProcess
+    running: false
+    stdinEnabled: true
+    stdout: SplitParser { onRead: function(line) { root.onSurfaceFrame(line) } }
+    stderr: SplitParser { onRead: function(line) { if (String(line).trim() !== "") console.warn(line) } }
+    onExited: function(exitCode) {
+      root.applyLink("absent", "alertroster-surface exited (" + exitCode + ")")
+      surfaceRestart.start()
+    }
+  }
+
+  Timer {
+    id: surfaceRestart
+    interval: 5000
+    onTriggered: root.startSurface()
+  }
+
+  function startSurface() {
+    if (surfaceProcess.running) return
+    surfaceProcess.command = [binDir + "/alertroster-surface"]
+    surfaceProcess.running = true
+  }
+
+  Component.onCompleted: startSurface()
+
+  function onSurfaceFrame(line) {
+    var frame
+    try { frame = JSON.parse(String(line)) } catch (e) { return }
+    if (!frame || typeof frame !== "object") return
+    switch (String(frame.event || "")) {
+      case "link":
+        applyLink(String(frame.state || "absent"), String(frame.detail || ""))
+        return
+      case "snapshot": {
+        var list = Model.alertsFrom(frame.alerts)
+        if (list === null) return
+        // Announce what is new to this machine on a re-snapshot; on the
+        // first one the takeover speaks for whatever is already paging.
+        var fresh = []
+        if (snapshotSeen) for (var i = 0; i < list.length; i++) if (!Model.findById(serviceAlerts, list[i].id)) fresh.push(list[i])
+        serviceAlerts = list
+        snapshotSeen = true
+        for (var j = 0; j < fresh.length; j++) announce(fresh[j])
+        return
+      }
+      case "alert.triggered":
+      case "alert.acknowledged":
+      case "alert.resolved":
+      case "alert.updated":
+      case "alert.expired": {
+        var alert = Model.tagServiceAlert(frame.alert)
+        if (!alert) return
+        var known = Model.findById(serviceAlerts, alert.id) !== null
+        serviceAlerts = Model.upsertOpen(serviceAlerts, alert)
+        if (pendingId === alert.id) settlePending()
+        if (frame.event === "alert.triggered" && !known) announce(alert)
+        // §3: expired is the outcome the product exists to prevent, and a
+        // surface must render it distinctly, never as an ordinary close.
+        if (frame.event === "alert.expired") notify("critical", "Nobody answered: " + alert.title, Model.sourceLabel(alert) + " · expired unacknowledged")
+        return
+      }
+      case "error":
+        if (String(frame.id || "") === pendingId && pendingId !== "") {
+          actionError = describeSurfaceError(String(frame.error || ""))
+          settlePending()
+        }
+        return
+    }
+  }
+
+  function describeSurfaceError(code) {
+    switch (code) {
+      case "link_down": return "receiver service unreachable — not acknowledged"
+      case "invalid_transition": return "the service refused the transition"
+      case "not_found": return "the service no longer holds that alert"
+    }
+    return "the receiver service refused: " + (code || "unknown")
+  }
+
+  function applyLink(state, detail) {
+    var was = surface
+    surface = state
+    surfaceDetail = detail
+    if (state === "absent" && serviceAlerts.length > 0) {
+      // Nothing is answering for these any more. Say so once, then let the
+      // board stop showing them as live.
+      notify("normal", "Receiver service went away", serviceAlerts.length + " alert(s) dropped from the board — " + detail)
+      serviceAlerts = []
+    }
+    if (state === "absent") snapshotSeen = false
+    if (state !== "live" && pendingAction !== "" && Model.isService(findIncident(pendingId) || {})) {
+      actionError = "receiver service unreachable — not acknowledged"
+      settlePending()
+    }
+    if (was !== "live" && state === "live") lastError = ""
+  }
+
+  // ---------------------------------------------------------------- cloud sync
   function refresh() {
     if (syncProcess.running) return
     syncing = true
@@ -174,12 +375,11 @@ Item {
 
   Process {
     id: actionProcess
-    property string incidentId: ""
     running: false
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
-      root.pendingAction = ""
+      root.settlePending()
       if (exitCode !== 0) root.actionError = String(actionErr.text || "").trim() || "the core refused"
       root.refresh()
     }
@@ -201,20 +401,15 @@ Item {
   }
 
   // ---------------------------------------------------------------- heartbeats
+  // `check` raises a page for every beat gone overdue through
+  // alertroster-page, so a lapsed heartbeat is a source of the receiver
+  // service like any other page — and lands here only when there is none.
   Process {
     id: heartbeatProcess
     running: false
     command: [root.binDir + "/alertroster-heartbeat", "check"]
-    stdout: StdioCollector { id: heartbeatOut; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (exitCode !== 0) return
-      var overdue = []
-      try { overdue = JSON.parse(String(heartbeatOut.text || "[]")) } catch (e) { return }
-      for (var i = 0; i < overdue.length; i++) {
-        var beat = overdue[i]
-        root.page("No heartbeat from " + beat.name + " for " + Model.ageLabel(new Date(Date.now() - beat.silentFor * 1000).toISOString(), Date.now()), beat.urgency, "heartbeat")
-      }
-    }
+    stdout: SplitParser { onRead: function(line) {} }
+    stderr: SplitParser { onRead: function(line) { if (String(line).trim() !== "") console.warn("alertroster-heartbeat: " + line) } }
   }
 
   // ---------------------------------------------------------------- alarm
@@ -293,7 +488,7 @@ Item {
           Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: "PAGING" + (takeover.incident && takeover.incident.escalate_at ? "   ·   " + Model.countdownLabel(takeover.incident.escalate_at, root.nowMs).toUpperCase() : "")
+            text: "PAGING" + (takeover.incident && Model.escalateAt(takeover.incident) ? "   ·   " + Model.countdownLabel(Model.escalateAt(takeover.incident), root.nowMs).toUpperCase() : "")
             color: takeover.urgent
             font.family: Style.font.family
             font.pixelSize: Style.font.title
@@ -316,14 +511,29 @@ Item {
           }
 
           Text {
+            visible: text !== ""
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            text: takeover.incident && takeover.incident.detail ? String(takeover.incident.detail) : ""
+            textFormat: Text.PlainText
+            color: Qt.darker(takeover.fg, 1.2)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.title
+            wrapMode: Text.Wrap
+            maximumLineCount: 3
+            elide: Text.ElideRight
+          }
+
+          Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             text: takeover.incident
               ? Model.sourceLabel(takeover.incident) + "   ·   triggered " + Model.ageLabel(takeover.incident.triggered_at, root.nowMs) + " ago"
                 + (takeover.incident.escalation_repeat_count > 0 ? "   ·   escalation " + takeover.incident.escalation_repeat_count : "")
+                + (Model.cloudLabel(takeover.incident) !== "" ? "   ·   " + Model.cloudLabel(takeover.incident) : "")
               : ""
             textFormat: Text.PlainText
-            color: Qt.darker(takeover.fg, 1.4)
+            color: Model.cloudFailed(takeover.incident) ? takeover.urgent : Qt.darker(takeover.fg, 1.4)
             font.family: Style.font.family
             font.pixelSize: Style.font.title
           }
@@ -357,11 +567,16 @@ Item {
           Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: root.actionError !== "" ? "Not acknowledged: " + root.actionError : "Escape does nothing. Dismiss requires an acknowledgement."
+            text: root.actionError !== ""
+              ? "Not acknowledged: " + root.actionError
+              : (Model.isService(takeover.incident) && !root.attached
+                  ? "Receiver service link is down — an acknowledgement cannot be recorded until it is back."
+                  : "Escape does nothing. Dismiss requires an acknowledgement.")
             textFormat: Text.PlainText
-            color: root.actionError !== "" ? takeover.urgent : Qt.darker(takeover.fg, 1.8)
+            color: root.actionError !== "" || (Model.isService(takeover.incident) && !root.attached) ? takeover.urgent : Qt.darker(takeover.fg, 1.8)
             font.family: Style.font.family
             font.pixelSize: Style.font.body
+            wrapMode: Text.Wrap
           }
         }
       }
@@ -370,7 +585,7 @@ Item {
 
   // ---------------------------------------------------------------- IPC
   //   omarchy-shell alertroster.pager page "Deploy failed" high cli
-  //   omarchy-shell alertroster.pager ack local-1
+  //   omarchy-shell alertroster.pager ack la_01J…   (or local-1)
   //   omarchy-shell alertroster.pager status
   IpcHandler {
     target: "alertroster.pager"
@@ -392,6 +607,8 @@ Item {
     }
     function status(): string {
       return JSON.stringify({
+        surface: root.surface,
+        surfaceDetail: root.surfaceDetail,
         link: root.link,
         paging: root.paging,
         open: root.incidents.length,

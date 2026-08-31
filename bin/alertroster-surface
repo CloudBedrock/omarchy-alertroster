@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Attach to alertroster-receiverd as a surface and speak JSON lines on stdio.
+
+The shell plugin runs this once and keeps it running. It holds the surface
+socket (LOCAL_ACK_PROTOCOL.md §5) open, writes every frame the service sends
+as one JSON line on stdout, and forwards every JSON line it reads on stdin
+to the service as an action:
+
+    ← {"event":"snapshot","alerts":[…]}
+    ← {"event":"alert.acknowledged","alert":{…}}
+    → {"action":"acknowledge","id":"la_…","user":"jim"}
+
+On top of the service's own frames it emits one of its own, so the plugin
+can say on screen what the link is doing:
+
+    ← {"event":"link","state":"live|down|starting|unauthorized|absent","detail":"…"}
+
+  live          attached and the snapshot has landed; what is rendered is true
+  down          was live and the socket dropped; re-dialling; the last
+                snapshot is stale and must be shown as such
+  starting      a token file is on disk, nothing answers yet; a service was
+                launched (if one is installed) and this is waiting for it
+  unauthorized  the service refused the token on disk (a stale file from a
+                service that has since restarted); re-reading and retrying
+  absent        no service to attach to — no token file and nothing to
+                launch, or a token file that has gone unanswered for good.
+                The plugin holds pages itself while this is the state.
+
+Only the standard library is used, on purpose: the plugin has to work on an
+Omarchy box straight after `omarchy plugin add`, and Quickshell's QML engine
+has no WebSocket type of its own. The re-dial cadence, the ping rule and the
+launch-once rule are the desktop's `ServiceLink`, so a machine running both
+behaves the same either way.
+"""
+
+import argparse
+import base64
+import json
+import os
+import random
+import select
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+PING_INTERVAL_S = 2.5          # one unanswered interval drops the socket (≤ 5 s to say "stale")
+UNAVAILABLE_AFTER_S = 60.0     # down this long after being live → absent, plugin drops the stale board
+GIVE_UP_STARTING_AFTER_S = 30.0  # token on disk, never answered → absent, keep knocking quietly
+ABSENT_RETRY_S = 5.0
+
+
+def emit(frame):
+    sys.stdout.write(json.dumps(frame, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def log(message):
+    sys.stderr.write("alertroster-surface: " + message + "\n")
+    sys.stderr.flush()
+
+
+def default_token_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.join(runtime, "alertroster", "surface.token")
+
+
+def read_token(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.readline().strip()
+    except OSError:
+        return ""
+
+
+def backoff_s(attempt):
+    # 500 ms doubling to a 5 s cap, jittered so several surfaces restarting
+    # the same service do not all knock at once.
+    cap = min(5.0, 0.5 * (1 << min(attempt, 4)))
+    return random.uniform(cap / 2, cap)
+
+
+class HandshakeRefused(Exception):
+    def __init__(self, status):
+        super().__init__("handshake refused: HTTP %d" % status)
+        self.status = status
+
+
+class Link:
+    """One WebSocket to the surface face. Text frames only, RFC 6455 client side."""
+
+    def __init__(self, host, port, token):
+        self.sock = socket.create_connection((host, port), timeout=3.0)
+        self.buffer = bytearray()
+        self.fragments = []
+        self.pong_pending = False
+        self._handshake(host, port, token)
+        self.sock.settimeout(None)
+        self.sock.setblocking(False)
+
+    def _handshake(self, host, port, token):
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        # The token rides in the query rather than a header so the bridge and
+        # a browser-hosted surface look the same to the service (§5).
+        request = (
+            "GET /v1/surface?token=%s HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n" % (token, host, port, key)
+        )
+        self.sock.sendall(request.encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("closed during handshake")
+            head += chunk
+            if len(head) > 65536:
+                raise ConnectionError("handshake too long")
+        head, _, rest = head.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0].decode("latin-1")
+        parts = status_line.split(" ")
+        status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if status != 101:
+            raise HandshakeRefused(status)
+        self.buffer.extend(rest)
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def close(self):
+        try:
+            self._send_frame(0x8, b"")
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _send_frame(self, opcode, payload):
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", length))
+        mask = os.urandom(4)
+        header.extend(mask)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(bytes(header) + masked)
+
+    def send_text(self, text):
+        self._send_frame(0x1, text.encode("utf-8"))
+
+    def ping(self):
+        self._send_frame(0x9, b"surface")
+        self.pong_pending = True
+
+    def read(self):
+        """Pull what the socket has and return the complete text messages in it.
+        Raises ConnectionError when the peer is gone or sent a close."""
+        try:
+            chunk = self.sock.recv(65536)
+        except (BlockingIOError, InterruptedError):
+            chunk = None
+        if chunk == b"":
+            raise ConnectionError("closed by peer")
+        if chunk:
+            self.buffer.extend(chunk)
+        return self.pending()
+
+    def pending(self):
+        """Complete text messages already in the buffer — the snapshot usually
+        arrives in the same segment as the 101, so there is something to
+        deliver before the socket is ever readable again."""
+        messages = []
+        while True:
+            frame = self._pop_frame()
+            if frame is None:
+                break
+            fin, opcode, payload = frame
+            if opcode == 0x8:
+                raise ConnectionError("close frame")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                self.pong_pending = False
+                continue
+            if opcode in (0x1, 0x0):
+                self.fragments.append(payload)
+                if fin:
+                    messages.append(b"".join(self.fragments).decode("utf-8", "replace"))
+                    self.fragments = []
+            # 0x2 binary and reserved opcodes: not in this protocol, ignored.
+        return messages
+
+    def _pop_frame(self):
+        buf = self.buffer
+        if len(buf) < 2:
+            return None
+        fin = bool(buf[0] & 0x80)
+        opcode = buf[0] & 0x0F
+        masked = bool(buf[1] & 0x80)
+        length = buf[1] & 0x7F
+        offset = 2
+        if length == 126:
+            if len(buf) < 4:
+                return None
+            length = struct.unpack("!H", bytes(buf[2:4]))[0]
+            offset = 4
+        elif length == 127:
+            if len(buf) < 10:
+                return None
+            length = struct.unpack("!Q", bytes(buf[2:10]))[0]
+            offset = 10
+        mask = b""
+        if masked:
+            if len(buf) < offset + 4:
+                return None
+            mask = bytes(buf[offset:offset + 4])
+            offset += 4
+        if len(buf) < offset + length:
+            return None
+        payload = bytes(buf[offset:offset + length])
+        del buf[:offset + length]
+        if masked:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return fin, opcode, payload
+
+
+class Bridge:
+    def __init__(self, args):
+        self.args = args
+        self.state = None
+        self.link = None
+        self.attempt = 0
+        self.was_live = False
+        self.since_contact = None      # when the current run of failures began
+        self.launched = False
+        self.next_dial = 0.0
+        self.next_ping = 0.0
+        self.stdin_buffer = b""
+
+    # ---- link state -------------------------------------------------------
+    def set_state(self, state, detail=""):
+        if state == self.state:
+            return
+        self.state = state
+        frame = {"event": "link", "state": state}
+        if detail:
+            frame["detail"] = detail
+        emit(frame)
+
+    def try_launch(self):
+        # A token file with nothing behind it means a service that is not
+        # running. If one is installed, start it — once per bridge lifetime;
+        # a second instance exits on its own when the port is taken.
+        if self.launched or self.args.no_launch:
+            return False
+        self.launched = True
+        binary = shutil.which("alertroster-receiverd")
+        if not binary:
+            return False
+        try:
+            subprocess.Popen([binary], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            log("could not start %s: %s" % (binary, error))
+            return False
+        log("started " + binary)
+        return True
+
+    def dial(self):
+        token = read_token(self.args.token_file)
+        now = time.monotonic()
+        if self.since_contact is None:
+            self.since_contact = now
+        gone_for = now - self.since_contact
+
+        if not token:
+            if self.was_live and gone_for < UNAVAILABLE_AFTER_S:
+                self.set_state("down", "the receiver service went away")
+                self.next_dial = now + backoff_s(self.attempt)
+            elif self.try_launch():
+                self.set_state("starting", "starting alertroster-receiverd")
+                self.next_dial = now + 1.0
+            else:
+                self.set_state("absent", "no receiver service on this machine")
+                self.next_dial = now + ABSENT_RETRY_S
+            self.attempt += 1
+            return
+
+        try:
+            self.link = Link(self.args.host, self.args.port, token)
+        except HandshakeRefused as refused:
+            self.link = None
+            self.attempt += 1
+            if refused.status in (401, 403):
+                self.set_state("unauthorized", "the receiver service refused the surface token on disk")
+            else:
+                self.set_state("down" if self.was_live else "starting",
+                               "receiver service answered HTTP %d" % refused.status)
+            self.next_dial = now + backoff_s(self.attempt)
+            return
+        except OSError as error:
+            self.link = None
+            self.attempt += 1
+            if self.was_live:
+                if gone_for > UNAVAILABLE_AFTER_S:
+                    self.set_state("absent", "the receiver service has been gone for %ds" % gone_for)
+                    self.try_launch()
+                    self.next_dial = now + ABSENT_RETRY_S
+                else:
+                    self.set_state("down", "receiver service unreachable: %s" % error)
+                    self.next_dial = now + backoff_s(self.attempt)
+            elif gone_for > GIVE_UP_STARTING_AFTER_S:
+                self.set_state("absent", "a surface token is on disk but nothing answers on 127.0.0.1:%d" % self.args.port)
+                self.next_dial = now + ABSENT_RETRY_S
+            else:
+                launched = self.try_launch()
+                self.set_state("starting", "starting alertroster-receiverd" if launched else "waiting for the receiver service")
+                self.next_dial = now + backoff_s(self.attempt)
+            return
+
+        # Connected is not live: the snapshot is what makes the board true —
+        # and it may already be sitting in the handshake's leftover bytes.
+        self.next_ping = now + PING_INTERVAL_S
+        for message in self.link.pending():
+            self.on_message(message)
+
+    def drop(self, reason):
+        if self.link is not None:
+            self.link.close()
+            self.link = None
+        now = time.monotonic()
+        if self.was_live:
+            # The clock of silence starts now, not at the last snapshot.
+            self.since_contact = now
+            self.attempt = 1
+            self.set_state("down", reason)
+        else:
+            self.attempt += 1
+        self.next_dial = now + backoff_s(self.attempt)
+
+    # ---- frames -----------------------------------------------------------
+    def on_message(self, text):
+        try:
+            frame = json.loads(text)
+        except ValueError:
+            log("unreadable frame from the service: " + text[:200])
+            return
+        if not isinstance(frame, dict):
+            return
+        if frame.get("event") == "snapshot":
+            self.was_live = True
+            self.since_contact = None
+            self.attempt = 0
+            self.set_state("live")
+        emit(frame)
+
+    def on_stdin_line(self, line):
+        line = line.strip()
+        if not line:
+            return
+        try:
+            frame = json.loads(line)
+        except ValueError:
+            log("unreadable line on stdin: " + line[:200])
+            return
+        if not isinstance(frame, dict):
+            return
+        if frame.get("control") == "reconnect":
+            self.drop("reconnect requested")
+            self.next_dial = time.monotonic()
+            return
+        if self.link is None or self.state != "live":
+            emit({"event": "error", "error": "link_down", "action": frame.get("action"), "id": frame.get("id")})
+            return
+        try:
+            self.link.send_text(json.dumps(frame, separators=(",", ":")))
+        except OSError as error:
+            emit({"event": "error", "error": "link_down", "action": frame.get("action"), "id": frame.get("id")})
+            self.drop("send failed: %s" % error)
+
+    # ---- loop -------------------------------------------------------------
+    def run(self):
+        stdin_fd = sys.stdin.fileno()
+        os.set_blocking(stdin_fd, False)
+        stdin_open = True
+        while True:
+            now = time.monotonic()
+            if self.link is None and now >= self.next_dial:
+                self.dial()
+                now = time.monotonic()
+
+            if self.link is not None and now >= self.next_ping:
+                if self.link.pong_pending:
+                    self.drop("no pong within %.1fs" % PING_INTERVAL_S)
+                    continue
+                try:
+                    self.link.ping()
+                except OSError as error:
+                    self.drop("ping failed: %s" % error)
+                    continue
+                self.next_ping = now + PING_INTERVAL_S
+
+            deadlines = [self.next_dial if self.link is None else self.next_ping]
+            timeout = max(0.05, min(deadlines) - now)
+            readers = [stdin_fd] if stdin_open else []
+            if self.link is not None:
+                readers.append(self.link)
+            try:
+                ready, _, _ = select.select(readers, [], [], timeout)
+            except InterruptedError:
+                continue
+
+            for reader in ready:
+                if reader is stdin_fd:
+                    try:
+                        chunk = os.read(stdin_fd, 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        # The plugin closed our stdin: it is going away, so are we.
+                        if self.link is not None:
+                            self.link.close()
+                        return 0
+                    self.stdin_buffer += chunk
+                    while b"\n" in self.stdin_buffer:
+                        line, _, self.stdin_buffer = self.stdin_buffer.partition(b"\n")
+                        self.on_stdin_line(line.decode("utf-8", "replace"))
+                elif reader is self.link:
+                    try:
+                        messages = self.link.read()
+                    except (ConnectionError, OSError) as error:
+                        self.drop(str(error))
+                        break
+                    for message in messages:
+                        self.on_message(message)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--token-file", default=default_token_path(), help="surface token the service wrote (§6.3)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=4747)
+    parser.add_argument("--no-launch", action="store_true", help="never start alertroster-receiverd, only attach")
+    args = parser.parse_args()
+    try:
+        return Bridge(args).run()
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

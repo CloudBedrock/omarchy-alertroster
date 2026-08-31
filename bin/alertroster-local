@@ -1,0 +1,62 @@
+#!/bin/bash
+# One HTTP call against the receiver service (alertroster-receiverd), with the
+# credential resolved here so nothing else has to know where it lives.
+#
+#   alertroster-local GET  /v1/status
+#   alertroster-local POST /v1/alerts '{"title":"Database is down"}'
+#   alertroster-local POST /v1/alerts/la_…/acknowledge '{"user":"jim"}'
+#
+# The credential, in order:
+#   1. a paired source token in the keyring (alertroster-page --pair), together
+#      with the station it was paired to in ~/.config/alertroster/station — a
+#      service on another machine;
+#   2. the surface token the service on *this* machine writes for its own
+#      user's processes ($XDG_RUNTIME_DIR/alertroster/surface.token, protocol
+#      §6.3). Anything that can read it is a surface: it may raise alerts
+#      (recorded as this machine) and acknowledge them.
+#
+# Exit codes: 0 ok (body on stdout) · 3 no service — no token anywhere ·
+# 4 the token was refused · 5 unreachable or a non-2xx reply. The plugin and
+# alertroster-page key off these, so keep them stable.
+
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/alertroster"
+STATION_FILE="$CONFIG_DIR/station"
+TOKEN_FILE="${ALERTROSTER_SURFACE_TOKEN:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/alertroster/surface.token}"
+PORT="${ALERTROSTER_RECEIVER_PORT:-4747}"
+
+method="${1:-}"
+path="${2:-}"
+body="${3:-}"
+[[ -n $method && -n $path ]] || { echo "usage: alertroster-local <METHOD> <path> [json-body]" >&2; exit 2; }
+
+station="http://127.0.0.1:$PORT"
+token=""
+if [[ -f $STATION_FILE ]]; then
+  token="$(secret-tool lookup service alertroster kind receiver-token 2>/dev/null || true)"
+  [[ -n $token ]] && station="$(<"$STATION_FILE")"
+fi
+if [[ -z $token && -r $TOKEN_FILE ]]; then
+  IFS= read -r token <"$TOKEN_FILE" || true
+fi
+[[ -n $token ]] || exit 3
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+code=$(curl -sS --max-time 5 -o "$tmp" -w '%{http_code}' \
+  -X "$method" "${station%/}$path" \
+  -H "Authorization: Bearer $token" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  ${body:+--data "$body"} 2>>"$tmp.err") || { cat "$tmp.err" >&2; rm -f "$tmp.err"; exit 5; }
+rm -f "$tmp.err"
+
+cat "$tmp"
+case "$code" in
+  2*) exit 0 ;;
+  401) exit 4 ;;
+esac
+echo "alertroster-local: $method $path → HTTP $code" >&2
+exit 5

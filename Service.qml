@@ -90,18 +90,19 @@ Item {
   // Attached, a page is raised on the service like any other source's and
   // comes back down the socket; the id is not known until then. Otherwise
   // the embedded store holds it.
-  function page(title, urgency, source) {
+  function page(title, urgency, source, detail) {
     if (attached) {
-      raiseQueue.push({ title: String(title || ""), urgency: String(urgency || "high"), source: String(source || "shell") })
+      raiseQueue.push({ title: String(title || ""), urgency: String(urgency || "high"),
+                        source: String(source || "shell"), detail: String(detail || "") })
       raiseNext()
       return "sent"
     }
-    return pageLocally(title, urgency, source)
+    return pageLocally(title, urgency, source, detail)
   }
 
-  function pageLocally(title, urgency, source) {
+  function pageLocally(title, urgency, source, detail) {
     localSerial += 1
-    var incident = Model.makeLocalIncident(localSerial, title, urgency, source, nowIso())
+    var incident = Model.makeLocalIncident(localSerial, title, urgency, source, nowIso(), detail)
     localIncidents = localIncidents.concat([incident])
     announce(incident)
     return incident.id
@@ -112,9 +113,13 @@ Item {
     if (raiseProcess.running || raiseQueue.length === 0) return
     var next = raiseQueue.shift()
     raiseProcess.request = next
-    raiseProcess.command = [binDir + "/alertroster-local", "POST", "/v1/alerts",
+    // --surface pins this to the loopback service (never a paired station:
+    // the alert must come back down our own socket), and the dedup key makes
+    // a retry or a fallback after a timed-out-but-accepted POST idempotent.
+    raiseProcess.command = [binDir + "/alertroster-local", "--surface", "POST", "/v1/alerts",
       JSON.stringify({ title: next.title, urgency: next.urgency === "low" ? "low" : "high",
-                       detail: "Raised through the Omarchy shell (" + next.source + ")" })]
+                       detail: next.detail !== "" ? next.detail : "Raised through the Omarchy shell (" + next.source + ")",
+                       dedup_key: ("shell:" + next.source + ":" + next.title).slice(0, 200) })]
     raiseProcess.running = true
   }
 
@@ -128,7 +133,7 @@ Item {
       if (exitCode !== 0) {
         // The service did not take it. The page must still land somewhere.
         root.lastError = "Receiver service refused a page: " + (String(raiseErr.text || "").trim() || "exit " + exitCode)
-        root.pageLocally(request.title, request.urgency, request.source)
+        root.pageLocally(request.title, request.urgency, request.source, request.detail)
       }
       root.raiseNext()
     }
@@ -142,6 +147,11 @@ Item {
   }
 
   function notify(urgency, title, body) {
+    // Titles and source names are content a paired source chose;
+    // omarchy-notification-send re-parses leading-dash arguments as options,
+    // which would swallow exactly the notification that matters.
+    title = String(title || "").replace(/^\s*-+/, "")
+    body = String(body || "").replace(/^\s*-+/, "")
     Quickshell.execDetached([
       omarchyPath + "/bin/omarchy-notification-send",
       "--app-name", "AlertRoster",
@@ -212,9 +222,11 @@ Item {
     id: pendingTimeout
     interval: 6000
     onTriggered: {
-      if (root.pendingAction === "" || !Model.isService(root.findIncident(root.pendingId) || {})) return
-      root.actionError = "no answer from the receiver service"
-      root.settlePending()
+      if (root.pendingAction === "") return
+      var incident = root.findIncident(root.pendingId)
+      if (incident !== null && !Model.isService(incident)) return // cloud actions settle via actionProcess
+      if (incident !== null) root.actionError = "no answer from the receiver service"
+      root.settlePending() // gone from the board is settled, not stuck
     }
   }
 
@@ -272,6 +284,7 @@ Item {
         if (snapshotSeen) for (var i = 0; i < list.length; i++) if (!Model.findById(serviceAlerts, list[i].id)) fresh.push(list[i])
         serviceAlerts = list
         snapshotSeen = true
+        if (pendingAction !== "" && findIncident(pendingId) === null) settlePending()
         for (var j = 0; j < fresh.length; j++) announce(fresh[j])
         return
       }
@@ -320,9 +333,12 @@ Item {
       serviceAlerts = []
     }
     if (state === "absent") snapshotSeen = false
-    if (state !== "live" && pendingAction !== "" && Model.isService(findIncident(pendingId) || {})) {
-      actionError = "receiver service unreachable — not acknowledged"
-      settlePending()
+    if (state !== "live" && pendingAction !== "") {
+      var pendingIncident = findIncident(pendingId)
+      if (pendingIncident === null || Model.isService(pendingIncident)) {
+        if (pendingIncident !== null) actionError = "receiver service unreachable — not acknowledged"
+        settlePending()
+      }
     }
     if (was !== "live" && state === "live") lastError = ""
   }
@@ -591,7 +607,10 @@ Item {
     target: "alertroster.pager"
 
     function page(title: string, urgency: string, source: string): string {
-      return root.page(title, urgency, source)
+      return root.page(title, urgency, source, "")
+    }
+    function pageDetailed(title: string, urgency: string, source: string, detail: string): string {
+      return root.page(title, urgency, source, detail)
     }
     function ack(id: string): string { return root.acknowledge(id) }
     function resolve(id: string): string { return root.resolve(id) }

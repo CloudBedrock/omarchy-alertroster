@@ -3,6 +3,7 @@
 # credential resolved here so nothing else has to know where it lives.
 #
 #   alertroster-local GET  /v1/status
+#   alertroster-local --surface POST /v1/alerts '{"title":"…"}'   # loopback surface token only
 #   alertroster-local POST /v1/alerts '{"title":"Database is down"}'
 #   alertroster-local POST /v1/alerts/la_…/acknowledge '{"user":"jim"}'
 #
@@ -26,6 +27,9 @@ STATION_FILE="$CONFIG_DIR/station"
 TOKEN_FILE="${ALERTROSTER_SURFACE_TOKEN:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/alertroster/surface.token}"
 PORT="${ALERTROSTER_RECEIVER_PORT:-4747}"
 
+surface_only=0
+[[ ${1:-} == --surface ]] && { surface_only=1; shift; }
+
 method="${1:-}"
 path="${2:-}"
 body="${3:-}"
@@ -33,7 +37,7 @@ body="${3:-}"
 
 station="http://127.0.0.1:$PORT"
 token=""
-if [[ -f $STATION_FILE ]]; then
+if [[ -f $STATION_FILE && $surface_only == 0 ]]; then
   token="$(secret-tool lookup service alertroster kind receiver-token 2>/dev/null || true)"
   [[ -n $token ]] && station="$(<"$STATION_FILE")"
 fi
@@ -43,7 +47,7 @@ fi
 [[ -n $token ]] || exit 3
 
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+trap 'rm -f "$tmp" "$tmp.err"' EXIT
 
 code=$(curl -sS --max-time 5 -o "$tmp" -w '%{http_code}' \
   -X "$method" "${station%/}$path" \

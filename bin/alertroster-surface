@@ -35,6 +35,7 @@ behaves the same either way.
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import random
@@ -45,6 +46,7 @@ import struct
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 PING_INTERVAL_S = 2.5          # one unanswered interval drops the socket (≤ 5 s to say "stale")
 UNAVAILABLE_AFTER_S = 60.0     # down this long after being live → absent, plugin drops the stale board
@@ -111,7 +113,7 @@ class Link:
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Key: %s\r\n"
             "Sec-WebSocket-Version: 13\r\n"
-            "\r\n" % (token, host, port, key)
+            "\r\n" % (quote(token, safe=""), host, port, key)
         )
         self.sock.sendall(request.encode("ascii"))
         head = b""
@@ -128,6 +130,14 @@ class Link:
         status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
         if status != 101:
             raise HandshakeRefused(status)
+        accept = ""
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"sec-websocket-accept":
+                accept = value.strip().decode("latin-1")
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        if accept != expected:
+            raise ConnectionError("peer answered 101 but is not a WebSocket server")
         self.buffer.extend(rest)
 
     def fileno(self):
@@ -247,7 +257,7 @@ class Bridge:
         self.attempt = 0
         self.was_live = False
         self.since_contact = None      # when the current run of failures began
-        self.launched = False
+        self.launched_at = None        # when we last started a service ourselves
         self.next_dial = 0.0
         self.next_ping = 0.0
         self.stdin_buffer = b""
@@ -264,11 +274,13 @@ class Bridge:
 
     def try_launch(self):
         # A token file with nothing behind it means a service that is not
-        # running. If one is installed, start it — once per bridge lifetime;
-        # a second instance exits on its own when the port is taken.
-        if self.launched or self.args.no_launch:
+        # running. If one is installed, start it — at most once a minute; a
+        # second instance exits on its own when the port is taken.
+        if self.args.no_launch:
             return False
-        self.launched = True
+        now = time.monotonic()
+        if self.launched_at is not None and now - self.launched_at < 60.0:
+            return False
         binary = shutil.which("alertroster-receiverd")
         if not binary:
             return False
@@ -278,6 +290,7 @@ class Bridge:
         except OSError as error:
             log("could not start %s: %s" % (binary, error))
             return False
+        self.launched_at = now
         log("started " + binary)
         return True
 
@@ -294,6 +307,12 @@ class Bridge:
                 self.next_dial = now + backoff_s(self.attempt)
             elif self.try_launch():
                 self.set_state("starting", "starting alertroster-receiverd")
+                self.next_dial = now + 1.0
+            elif self.launched_at is not None and now - self.launched_at < GIVE_UP_STARTING_AFTER_S:
+                # A service we started needs a moment to write its token; do
+                # not fall to absent (and make the plugin drop the board)
+                # while it is still coming up.
+                self.set_state("starting", "waiting for alertroster-receiverd to write its token")
                 self.next_dial = now + 1.0
             else:
                 self.set_state("absent", "no receiver service on this machine")
@@ -336,8 +355,11 @@ class Bridge:
         # Connected is not live: the snapshot is what makes the board true —
         # and it may already be sitting in the handshake's leftover bytes.
         self.next_ping = now + PING_INTERVAL_S
-        for message in self.link.pending():
-            self.on_message(message)
+        try:
+            for message in self.link.pending():
+                self.on_message(message)
+        except (ConnectionError, OSError) as error:
+            self.drop(str(error))
 
     def drop(self, reason):
         if self.link is not None:

@@ -150,7 +150,7 @@ def main():
         rc, out, err = run_cli("alertroster-page", "Shell fallback", env=cli_env)
         check("alertroster-page falls back to the shell", rc == 0 and out == "local-1", (rc, out, err))
         with open(os.path.join(tmp, "shell-calls")) as calls:
-            check("the shell got the page", "page Shell fallback high cli" in calls.read())
+            check("the shell got the page", "pageDetailed Shell fallback high cli" in calls.read())
         bridge.close()
 
         print("service up:")

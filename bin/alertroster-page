@@ -3,21 +3,40 @@
 #
 #   alertroster-page "Database is down"
 #   alertroster-page --low "Backup finished with warnings"
+#   alertroster-page --detail "exit 137 in step 4" --timeout 600 "Deploy failed"
 #   make deploy || alertroster-page "Deploy failed: $(hostname)"
 #
 # A high-urgency page takes over the screen and sounds the alarm until it is
 # acknowledged (Enter on the takeover, or the bar panel). A low-urgency page
 # is a red count in the bar and a notification.
 #
+# Where the page goes: to the receiver service (alertroster-receiverd) when
+# one is running on this machine — it holds the pending acknowledgment, times
+# it out, fans it out to every surface and output, and forwards it off-site if
+# an integration key is configured. When no service answers, the page goes to
+# the Omarchy shell and the plugin holds it itself. Either way you see the
+# same takeover.
+#
+#   alertroster-page --pair 48213907 --station http://kitchen-pc:4747
+#       Pair this CLI with a receiver service on another machine (the code
+#       comes from that station's Pairing screen). After this, pages go there.
+#   alertroster-page --unpair
+#
 # With --remote the page is raised on your AlertRoster account instead, so it
 # escalates to the roster's phones if you do not answer. That needs a sync
 # integration key for a source on the account (alertroster-login --sync-key).
-# Without --remote it stays local.
 
 set -euo pipefail
 
+BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/alertroster"
+STATION_FILE="$CONFIG_DIR/station"
+
 urgency="high"
 source="cli"
+detail=""
+timeout=""
+dedup=""
 remote=0
 args=()
 while (( $# > 0 )); do
@@ -25,8 +44,33 @@ while (( $# > 0 )); do
     --low) urgency="low"; shift ;;
     --high) urgency="high"; shift ;;
     --source) source="${2:?--source needs a name}"; shift 2 ;;
+    --detail) detail="${2:?--detail needs text}"; shift 2 ;;
+    --timeout) timeout="${2:?--timeout needs seconds (0 = none)}"; shift 2 ;;
+    --dedup) dedup="${2:?--dedup needs a key}"; shift 2 ;;   # one open alert per key; a repeat returns it
     --remote) remote=1; shift ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    --pair)
+      code="${2:?--pair needs the 8-digit code from the Pairing screen of the station}"; shift 2
+      station="http://127.0.0.1:${ALERTROSTER_RECEIVER_PORT:-4747}"
+      [[ ${1:-} == --station ]] && { station="${2:?--station needs a URL}"; shift 2; }
+      body=$(jq -cn --arg c "$code" --arg n "alertroster-page@$(hostname)" '{code:$c, name:$n, kind:"cli"}')
+      out=$(curl -sS --max-time 8 -w '\n%{http_code}' -X POST "${station%/}/v1/pair" \
+        -H "Content-Type: application/json" --data "$body") || { echo "alertroster-page: $station did not answer" >&2; exit 5; }
+      http=${out##*$'\n'}; out=${out%$'\n'*}
+      [[ $http == 201 ]] || { echo "alertroster-page: pairing refused (HTTP $http) — wrong code, or the window is shut" >&2; exit 4; }
+      token=$(jq -r '.token // empty' <<<"$out")
+      [[ -n $token ]] || { echo "alertroster-page: unexpected reply from $station" >&2; exit 5; }
+      mkdir -p "$CONFIG_DIR"
+      printf %s "${station%/}" >"$STATION_FILE"
+      printf %s "$token" | secret-tool store --label "AlertRoster receiver token" service alertroster kind receiver-token
+      echo "Paired with $station as $(jq -r .id <<<"$out"). Pages from this machine now go there."
+      exit 0 ;;
+    --unpair)
+      "$BIN_DIR/alertroster-local" DELETE /v1/sources/self >/dev/null 2>&1 || true
+      secret-tool clear service alertroster kind receiver-token 2>/dev/null || true
+      rm -f "$STATION_FILE"
+      echo "Unpaired. Pages go to the service on this machine, or to the shell."
+      exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) args+=("$1"); shift ;;
   esac
 done
@@ -41,7 +85,7 @@ if (( remote )); then
   key=$(secret-tool lookup service alertroster kind sync-key 2>/dev/null) || true
   [[ -n $key ]] || { echo "alertroster-page: no integration key — run: alertroster-login --sync-key ark_sync_..." >&2; exit 3; }
   host="https://alertroster.com"
-  hf="${XDG_CONFIG_HOME:-$HOME/.config}/alertroster/host"; [[ -f $hf ]] && host="$(<"$hf")"
+  hf="$CONFIG_DIR/host"; [[ -f $hf ]] && host="$(<"$hf")"
   body=$(jq -cn --arg t "$title" --arg u "$urgency" --arg s "$source" \
     '{title:$t, urgency:$u, dedup_key:($s + ":" + ($t|@base64))}')
   out=$(curl -sS --max-time 8 -w '\n%{http_code}' -X POST "${host%/}/api/v2/incidents" \
@@ -56,6 +100,24 @@ if (( remote )); then
   omarchy-shell alertroster.pager refresh >/dev/null 2>&1 || true
   exit
 fi
+
+# The receiver service first. It answers with the alert as it is now: 201 for
+# a new one, 200 when an open alert already carried this dedup key.
+body=$(jq -cn --arg t "$title" --arg u "$urgency" --arg d "$detail" --arg k "$dedup" --arg s "$timeout" \
+  '{title:$t, urgency:$u}
+   + (if $d == "" then {} else {detail:$d} end)
+   + (if $k == "" then {} else {dedup_key:($k|.[0:200])} end)
+   + (if $s == "" then {} else {ack_timeout_seconds:($s|tonumber)} end)')
+set +e
+out=$("$BIN_DIR/alertroster-local" POST /v1/alerts "$body" 2>&1)
+rc=$?
+set -e
+case $rc in
+  0) echo "Paging via the receiver service: $(jq -r '.alert.id' <<<"$out")"; exit 0 ;;
+  3) ;;  # no service on this machine — the shell holds it
+  4|5) echo "alertroster-page: the receiver service did not take it ($(tr '\n' ' ' <<<"$out")) — paging through the shell instead" >&2 ;;
+  *) echo "$out" >&2; exit "$rc" ;;
+esac
 
 result=$(omarchy-shell alertroster.pager page "$title" "$urgency" "$source" 2>&1) || {
   echo "alertroster-page: the Omarchy shell did not answer — is the Pager plugin enabled?" >&2

@@ -6,14 +6,17 @@
 #   alertroster-heartbeat ping nightly-backup            # put this at the end of the job
 #   alertroster-heartbeat forget nightly-backup
 #   alertroster-heartbeat list
-#   alertroster-heartbeat check                          # used by the plugin; prints overdue names as JSON
+#   alertroster-heartbeat check                          # run by the plugin; pages for every beat gone overdue
 #
 # "expect" records how often a ping must arrive. "ping" touches the stamp.
-# The plugin runs "check" on its refresh interval and raises a page for each
-# beat that has gone overdue, once per lapse.
+# The plugin runs "check" on its refresh interval; "check" raises one page per
+# beat that has gone overdue, once per lapse, through alertroster-page — so a
+# lapsed heartbeat is a source of the receiver service like any other page,
+# and lands on the shell only when no service is running.
 
 set -euo pipefail
 
+BIN_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/alertroster/heartbeats.json"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/alertroster/heartbeats"
 mkdir -p "$(dirname "$CONFIG")" "$STATE"
@@ -66,18 +69,24 @@ case "$cmd" in
     ;;
   check)
     now=$(date +%s)
-    out="[]"
     while IFS=$'\t' read -r n every u; do
       [[ -n $n ]] || continue
       stamp="$STATE/$n"
       last=0; [[ -f $stamp ]] && last=$(stat -c %Y "$stamp")
       if (( now - last > every )) && [[ ! -f $stamp.paged ]]; then
         touch "$stamp.paged"
-        out=$(jq -c --arg n "$n" --arg u "$u" --argjson a $(( now - last )) \
-          '. + [{name:$n, urgency:$u, silentFor:$a}]' <<<"$out")
+        silent=$(( now - last ))
+        if (( silent >= 172800 )); then ago="$(( silent / 86400 ))d"
+        elif (( silent >= 3600 )); then ago="$(( silent / 3600 ))h $(( silent % 3600 / 60 ))m"
+        elif (( silent >= 60 )); then ago="$(( silent / 60 ))m"
+        else ago="${silent}s"; fi
+        [[ $last == 0 ]] && ago="ever"
+        flag=(); [[ $u == low ]] && flag=(--low)
+        "$BIN_DIR/alertroster-page" "${flag[@]}" --source heartbeat --dedup "heartbeat:$n" \
+          --detail "Expected a ping every ${every}s. Clear it with: alertroster-heartbeat ping $n" \
+          "No heartbeat from $n for $ago" || true
       fi
     done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.every)\t\(.value.urgency)"' "$CONFIG")
-    echo "$out"
     ;;
   *)
     sed -n '2,13p' "$0"; exit 2 ;;

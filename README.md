@@ -62,7 +62,8 @@ that is allowed to listen for pages, and nothing pages it without a token.
 
 ## The receiver service
 
-[AlertRoster desktop](https://alertroster.com) ships `alertroster-receiverd`,
+[AlertRoster desktop](https://github.com/CloudBedrock/alertroster-desktop-releases/releases/latest)
+ships `alertroster-receiverd`,
 a headless service that holds every pending acknowledgement for this machine:
 who fired it, how long it has gone unanswered, who answered and when. When it
 is running, this plugin is one of its *surfaces* — it renders what the
@@ -78,6 +79,11 @@ username. That is what lets one page reach everything you own at once:
   same timeout, the same fan-out and the same record.
 - **Heartbeats** that lapse become alerts on the service, not pages the
   plugin holds by itself.
+
+**[Download the receiver station →](https://github.com/CloudBedrock/alertroster-desktop-releases/releases/latest)**
+— free, and it runs on this machine, a Mac, a Windows box or a Raspberry Pi on
+the wall. You do not need it to page yourself; you need it for everything in
+the list above.
 
 Nothing changes in how you use it. The plugin finds the service on loopback
 (`127.0.0.1:4747`) through the token file it writes for its own user, starts
